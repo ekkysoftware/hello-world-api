@@ -255,7 +255,7 @@ jobs:
           # the release commit is rejected. GITHUB_TOKEN cannot do this.
           token: ${{ secrets.RELEASE_TOKEN }}
 
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
