@@ -10,12 +10,39 @@ requires-python = ">=3.14"
 dependencies = [
     "fastapi>=0.156.7",
     "mangum>=0.22.0",
-    "uvicorn>=0.54.0",
 ]
-
-[project.scripts]
-hello-world-api = "hello_world_api:main"
 
 [build-system]
 requires = ["uv_build>=0.13.0,<0.14.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+    "ruff>=0.17.1",
+    "uvicorn>=0.54.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+# python-semantic-release: bumps project.version in this file on release.
+[tool.semantic_release]
+version_toml = ["pyproject.toml:project.version"]
+commit_parser = "conventional"
+changelog_file = "CHANGELOG.md"
+allow_zero_version = true
+commit_message = "chore(release): {version}"
+tag_format = "v{version}"
+
+[tool.semantic_release.branches.main]
+match = "main"

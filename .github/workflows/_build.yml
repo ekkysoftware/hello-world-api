@@ -1,0 +1,108 @@
+# Reusable build. Called by ci.yml (as a gate) and deploy.yml (as the artifact
+# that actually ships), so both paths run byte-identical steps and cannot drift.
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Branch, tag or SHA to build (default, the triggering commit)
+        type: string
+        required: false
+      uv-version:
+        type: string
+        default: "0.13.0"
+      upload-artifact:
+        description: Upload lambda.zip as a workflow artifact (deploy needs this)
+        type: boolean
+        default: true
+      retention-days:
+        type: number
+        default: 30
+    outputs:
+      sha:
+        description: Commit the artifact was built from
+        value: ${{ jobs.build.outputs.sha }}
+      version:
+        description: project.version at build time
+        value: ${{ jobs.build.outputs.version }}
+      sha256:
+        description: Hex sha256 of lambda.zip
+        value: ${{ jobs.build.outputs.sha256 }}
+      artifact_key:
+        description: S3 object key the deploy jobs upload to
+        value: ${{ jobs.build.outputs.artifact_key }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.meta.outputs.sha }}
+      version: ${{ steps.meta.outputs.version }}
+      sha256: ${{ steps.meta.outputs.sha256 }}
+      artifact_key: ${{ steps.meta.outputs.artifact_key }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - uses: astral-sh/setup-uv@v10
+        with:
+          version: ${{ inputs.uv-version }}
+          enable-cache: true
+
+      - run: uv python install
+
+      # The target runtime comes from .python-version (single source of truth for
+      # uv, the build script and this workflow).
+      - name: build lambda.zip
+        run: ./scripts/build_lambda.sh
+
+      # Catches the failure mode that a successful `uv build` does not: the zip
+      # exists but the handler cannot be imported from it.
+      - name: verify handler is importable from the artifact
+        run: |
+          cd build/lambda
+          PYTHONPATH=. python - <<'EOF'
+          from mangum import Mangum
+
+          from hello_world_api.main import handler
+
+          assert isinstance(handler, Mangum), type(handler)
+          print("ok: hello_world_api.main.handler", handler)
+          EOF
+
+      - id: meta
+        run: |
+          sha=$(git rev-parse HEAD)
+          {
+            echo "sha=$sha"
+            echo "version=$(uv version --short)"
+            echo "sha256=$(sha256sum dist/lambda.zip | cut -d' ' -f1)"
+            echo "artifact_key=lambda/$sha.zip"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: report artifact
+        run: |
+          {
+            echo "### Lambda artifact"
+            echo
+            echo "| key | value |"
+            echo "| --- | --- |"
+            echo "| sha | \`${{ steps.meta.outputs.sha }}\` |"
+            echo "| version | \`${{ steps.meta.outputs.version }}\` |"
+            echo "| size | $(du -h dist/lambda.zip | cut -f1) |"
+            echo "| sha256 | \`${{ steps.meta.outputs.sha256 }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        if: inputs.upload-artifact
+        with:
+          name: lambda-${{ steps.meta.outputs.sha }}
+          path: dist/lambda.zip
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention-days }}

@@ -1,17 +1,10 @@
-from fastapi import FastAPI
-from mangum import Mangum
+"""Local development entrypoint.
 
-app = FastAPI()
+The Lambda handler is ``hello_world_api.main.handler``; this file only exists so
+``uv run python main.py`` keeps working. Requires ``uv sync`` first.
+"""
 
-
-@app.get("/")
-def hello():
-    return {"message": "hello"}
-
-
-# AWS Lambda entrypoint: Lambda console/CLI handler is "main.handler".
-handler = Mangum(app)
-
+from hello_world_api.main import app
 
 if __name__ == "__main__":
     import uvicorn
