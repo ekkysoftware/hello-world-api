@@ -64,16 +64,24 @@ jobs:
 
       # Catches the failure mode that a successful `uv build` does not: the zip
       # exists but the handler cannot be imported from it.
+      # Must use the .python-version interpreter: the wheels in the artifact are
+      # built for that ABI, and the runner's system python cannot load them.
       - name: verify handler is importable from the artifact
         run: |
-          cd build/lambda
-          PYTHONPATH=. python - <<'EOF'
+          python_bin=$(uv python find "$(tr -d '[:space:]' < .python-version)")
+          echo "interpreter: $python_bin ($($python_bin -V))"
+          PYTHONPATH=build/lambda "$python_bin" - <<'EOF'
+          import sys
+
+          import pydantic_core
           from mangum import Mangum
 
           from hello_world_api.main import handler
 
           assert isinstance(handler, Mangum), type(handler)
-          print("ok: hello_world_api.main.handler", handler)
+          # Guard against accidentally importing the project venv instead of the zip.
+          assert "build/lambda" in pydantic_core.__file__, pydantic_core.__file__
+          print(f"ok: python {sys.version.split()[0]}, {handler}")
           EOF
 
       - id: meta
