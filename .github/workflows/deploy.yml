@@ -269,12 +269,16 @@ jobs:
       - id: next
         name: compute next version
         run: |
+          current=$(uv version --short)
           next=$(uvx --from "python-semantic-release==${PSR_VERSION}" semantic-release version --print 2>/dev/null | tail -1)
-          echo "version=$next" >> "$GITHUB_OUTPUT"
-          if [ -z "$next" ]; then
-            echo "::notice title=No release::No conventional commits since the last tag"
+          # `--print` returns the CURRENT version when nothing is releasable, not an
+          # empty string, so the comparison (not an emptiness check) is the guard.
+          if [ -z "$next" ] || [ "$next" = "$current" ]; then
+            echo "version=" >> "$GITHUB_OUTPUT"
+            echo "::notice title=No release::No releasable commits since the last tag (still $current)"
           else
-            echo "::notice title=Release::$next"
+            echo "version=$next" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Release::$current -> $next"
           fi
 
       - name: bump version and changelog
