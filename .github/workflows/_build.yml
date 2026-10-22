@@ -1,5 +1,4 @@
-# Reusable build. Called by ci.yml (as a gate) and deploy.yml (as the artifact
-# that actually ships), so both paths run byte-identical steps and cannot drift.
+# Reusable build: called by ci.yml (gate) and deploy.yml (the artifact that ships).
 name: Build
 
 on:
@@ -57,15 +56,9 @@ jobs:
 
       - run: uv python install
 
-      # The target runtime comes from .python-version (single source of truth for
-      # uv, the build script and this workflow).
       - name: build lambda.zip
         run: ./scripts/build_lambda.sh
 
-      # Catches the failure mode that a successful `uv build` does not: the zip
-      # exists but the handler cannot be imported from it.
-      # Must use the .python-version interpreter: the wheels in the artifact are
-      # built for that ABI, and the runner's system python cannot load them.
       - name: verify handler is importable from the artifact
         run: |
           python_bin=$(uv python find "$(tr -d '[:space:]' < .python-version)")
@@ -79,7 +72,6 @@ jobs:
           from hello_world_api.main import handler
 
           assert isinstance(handler, Mangum), type(handler)
-          # Guard against accidentally importing the project venv instead of the zip.
           assert "build/lambda" in pydantic_core.__file__, pydantic_core.__file__
           print(f"ok: python {sys.version.split()[0]}, {handler}")
           EOF
@@ -87,11 +79,13 @@ jobs:
       - id: meta
         run: |
           sha=$(git rev-parse HEAD)
+          sha256=$(sha256sum dist/lambda.zip | cut -d' ' -f1)
           {
             echo "sha=$sha"
             echo "version=$(uv version --short)"
-            echo "sha256=$(sha256sum dist/lambda.zip | cut -d' ' -f1)"
-            echo "artifact_key=lambda/$sha.zip"
+            echo "sha256=$sha256"
+            # Content-addressed so a rebuild of identical code maps to the same object.
+            echo "artifact_key=lambda/$sha256.zip"
           } >> "$GITHUB_OUTPUT"
 
       - name: report artifact

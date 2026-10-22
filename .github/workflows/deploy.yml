@@ -1,24 +1,3 @@
-# Build once, deploy to staging, then promote the same artifact to production
-# after a human approves the `production` GitHub Environment.
-#
-# Infrastructure is managed by Pulumi *locally* (see infra/). CI never runs
-# Pulumi: it only uploads the code artifact and updates the existing functions.
-#
-# Required repo variables (Settings -> Variables):
-#   AWS_REGION, ARTIFACT_BUCKET,
-#   LAMBDA_STAGING, LAMBDA_PROD,        # function names created by infra/
-#   API_URL_STAGING, API_URL_PROD       # base URLs created by infra/
-# Optional: LAMBDA_ALIAS_STAGING, LAMBDA_ALIAS_PROD (e.g. "live"; enables
-#           version publishing + alias move instead of updating $LATEST),
-#           AWS_DEPLOY_ROLE_STAGING, AWS_DEPLOY_ROLE_PROD (if you switch to OIDC)
-#
-# Required repo secrets:
-#   AWS_ACCESS_KEY_ID_STAGING, AWS_SECRET_ACCESS_KEY_STAGING
-#   AWS_ACCESS_KEY_ID_PROD,    AWS_SECRET_ACCESS_KEY_PROD
-#   RELEASE_TOKEN              # PAT / GitHub App token able to push to protected main
-#
-# Environments required, exact and lowercase: `staging`, `production`.
-# Add required reviewers on `production` -> that is the approval gate.
 name: Deploy
 
 on:
@@ -35,6 +14,10 @@ on:
         description: Branch, tag or SHA to deploy
         type: string
         required: false
+      artifact_key:
+        description: "Promote an existing lambda/<sha256>.zip (production only, skips the build)"
+        type: string
+        required: false
 
 permissions:
   contents: read
@@ -46,20 +29,41 @@ env:
   ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET }}
 
 jobs:
-  # Until infra/ has been applied locally and the repo variables are set, deploy
-  # jobs are skipped instead of failing on every push. Also breaks the
-  # deploy -> release -> deploy loop.
   preflight:
     name: preflight
     runs-on: ubuntu-latest
     outputs:
       run: ${{ steps.check.outputs.run }}
+      sha: ${{ steps.check.outputs.sha }}
+      need_build: ${{ steps.check.outputs.need_build }}
+      artifact_key: ${{ steps.check.outputs.artifact_key }}
     steps:
       - id: check
         env:
           HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_ARTIFACT_KEY: ${{ inputs.artifact_key }}
+          INPUT_ENVIRONMENT: ${{ inputs.environment }}
         run: |
           set -o pipefail
+          echo "sha=${INPUT_REF:-$GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+          if [ -n "${INPUT_ARTIFACT_KEY:-}" ]; then
+            if [ "${INPUT_ENVIRONMENT:-}" = "staging" ]; then
+              echo "::error title=Unsupported::artifact_key only applies to environment=production"
+              exit 1
+            fi
+            if [[ ! "$INPUT_ARTIFACT_KEY" =~ ^lambda/[0-9a-f]{64}\.zip$ ]]; then
+              echo "::error title=Invalid artifact_key::Expected lambda/<64 hex>.zip, got '$INPUT_ARTIFACT_KEY'"
+              exit 1
+            fi
+            echo "need_build=false" >> "$GITHUB_OUTPUT"
+            echo "artifact_key=$INPUT_ARTIFACT_KEY" >> "$GITHUB_OUTPUT"
+          else
+            echo "need_build=true" >> "$GITHUB_OUTPUT"
+            echo "artifact_key=" >> "$GITHUB_OUTPUT"
+          fi
+
           if [[ "${HEAD_COMMIT_MESSAGE:-}" == "chore(release):"* ]]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
             echo "::notice title=Deploy skipped::Release commit, nothing to deploy"
@@ -80,18 +84,18 @@ jobs:
   build:
     name: build
     needs: preflight
-    if: needs.preflight.outputs.run == 'true'
+    if: needs.preflight.outputs.run == 'true' && needs.preflight.outputs.need_build == 'true'
     uses: ./.github/workflows/_build.yml
     with:
-      ref: ${{ inputs.ref || github.sha }}
+      ref: ${{ needs.preflight.outputs.sha }}
 
-  # Pushes to `development`, or manual dispatch with environment=staging.
   deploy-staging:
     name: deploy / staging
     runs-on: ubuntu-latest
     needs: [preflight, build]
     if: |
       needs.preflight.outputs.run == 'true' &&
+      needs.build.result == 'success' &&
       (github.event_name == 'push' && github.ref_name == 'development' ||
        github.event_name == 'workflow_dispatch' && inputs.environment == 'staging')
     environment:
@@ -112,21 +116,33 @@ jobs:
           name: lambda-${{ needs.build.outputs.sha }}
           path: dist
 
-      - name: upload artifact to s3
+      - name: publish artifact
+        env:
+          KEY: ${{ needs.build.outputs.artifact_key }}
+          SHA256: ${{ needs.build.outputs.sha256 }}
         run: |
-          aws s3 cp dist/lambda.zip \
-            "s3://${ARTIFACT_BUCKET}/${{ needs.build.outputs.artifact_key }}" \
-            --no-progress --only-show-errors
+          expected=$(sha256sum dist/lambda.zip | cut -d' ' -f1)
+          if [ "$expected" != "$SHA256" ]; then
+            echo "::error title=Artifact mismatch::downloaded $expected != reported $SHA256"
+            exit 1
+          fi
+          if aws s3api head-object --bucket "$ARTIFACT_BUCKET" --key "$KEY" >/dev/null 2>&1; then
+            echo "::notice title=Artifact present::$KEY already uploaded, left untouched"
+          else
+            aws s3 cp dist/lambda.zip "s3://${ARTIFACT_BUCKET}/$KEY" \
+              --no-progress --only-show-errors
+          fi
 
       - name: update function code
         env:
           FUNCTION_NAME: ${{ vars.LAMBDA_STAGING }}
           ALIAS: ${{ vars.LAMBDA_ALIAS_STAGING }}
+          KEY: ${{ needs.build.outputs.artifact_key }}
         run: |
           code_sha=$(aws lambda update-function-code \
             --function-name "$FUNCTION_NAME" \
             --s3-bucket "$ARTIFACT_BUCKET" \
-            --s3-key "${{ needs.build.outputs.artifact_key }}" \
+            --s3-key "$KEY" \
             --query CodeSha256 --output text --no-cli-pager)
           echo "deployed CodeSha256=$code_sha"
           aws lambda wait function-updated --function-name "$FUNCTION_NAME"
@@ -154,15 +170,29 @@ jobs:
           echo "::error title=Smoke test failed::$url did not return the expected payload"
           exit 1
 
-  # Pushes to `main`, or manual dispatch with environment=production.
-  # The `production` environment's required reviewers are the approval gate, so
-  # the prod AWS credentials are only ever used after a human approved.
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo "### Deploy / staging"
+            echo
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| function | \`${{ vars.LAMBDA_STAGING }}\` |"
+            echo "| artifact | \`${{ needs.build.outputs.artifact_key }}\` |"
+            echo "| url | ${{ vars.API_URL_STAGING }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   deploy-prod:
     name: deploy / production
     runs-on: ubuntu-latest
     needs: [preflight, build]
+    # always() because build is skipped when promoting an existing artifact.
     if: |
+      always() &&
       needs.preflight.outputs.run == 'true' &&
+      needs.build.result != 'failure' &&
+      needs.build.result != 'cancelled' &&
       (github.event_name == 'push' && github.ref_name == 'main' ||
        github.event_name == 'workflow_dispatch' && inputs.environment == 'production')
     environment:
@@ -178,26 +208,61 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_PROD }}
           aws-region: ${{ vars.AWS_REGION }}
 
+      - id: source
+        name: resolve artifact
+        env:
+          INPUT_KEY: ${{ needs.preflight.outputs.artifact_key }}
+          BUILT_KEY: ${{ needs.build.outputs.artifact_key }}
+        run: |
+          key="${INPUT_KEY:-$BUILT_KEY}"
+          if [ -z "$key" ]; then
+            echo "::error title=No artifact::Neither artifact_key nor a build result is available"
+            exit 1
+          fi
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Promoting::$key"
+
       - uses: actions/download-artifact@v8
+        if: needs.build.result == 'success'
         with:
           name: lambda-${{ needs.build.outputs.sha }}
           path: dist
 
-      - name: upload artifact to s3
+      - name: publish artifact (only when absent)
+        env:
+          KEY: ${{ steps.source.outputs.key }}
         run: |
-          aws s3 cp dist/lambda.zip \
-            "s3://${ARTIFACT_BUCKET}/${{ needs.build.outputs.artifact_key }}" \
-            --no-progress --only-show-errors
+          if aws s3api head-object --bucket "$ARTIFACT_BUCKET" --key "$KEY" >/dev/null 2>&1; then
+            echo "::notice title=Reusing::$KEY already exists, promoting the staged bytes unchanged"
+          else
+            aws s3 cp dist/lambda.zip "s3://${ARTIFACT_BUCKET}/$KEY" \
+              --no-progress --only-show-errors
+          fi
+
+      - name: verify artifact integrity
+        env:
+          KEY: ${{ steps.source.outputs.key }}
+        run: |
+          expected="${KEY#lambda/}"
+          expected="${expected%.zip}"
+          actual=$(aws s3 cp "s3://${ARTIFACT_BUCKET}/${KEY}" - \
+            --no-progress --only-show-errors | sha256sum | cut -d' ' -f1)
+          if [ "$actual" != "$expected" ]; then
+            echo "::error title=Artifact integrity::$KEY hashes to $actual"
+            exit 1
+          fi
+          echo "verified $KEY sha256=$actual"
 
       - name: update function code
         env:
           FUNCTION_NAME: ${{ vars.LAMBDA_PROD }}
           ALIAS: ${{ vars.LAMBDA_ALIAS_PROD }}
+          KEY: ${{ steps.source.outputs.key }}
         run: |
           code_sha=$(aws lambda update-function-code \
             --function-name "$FUNCTION_NAME" \
             --s3-bucket "$ARTIFACT_BUCKET" \
-            --s3-key "${{ needs.build.outputs.artifact_key }}" \
+            --s3-key "$KEY" \
             --query CodeSha256 --output text --no-cli-pager)
           echo "deployed CodeSha256=$code_sha"
           aws lambda wait function-updated --function-name "$FUNCTION_NAME"
@@ -225,15 +290,24 @@ jobs:
           echo "::error title=Smoke test failed::$url did not return the expected payload"
           exit 1
 
-  # Only after production is healthy, and only for merges to `main` (a manual
-  # promotion of an older SHA deploys but does not tag, since that commit is not
-  # the head of main and the release commit could not fast-forward).
-  # PSR runs with --no-commit/--no-tag/--no-push so the version bump, CHANGELOG
-  # and the refreshed uv.lock land in ONE commit with the tag on it.
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo "### Deploy / production"
+            echo
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| function | \`${{ vars.LAMBDA_PROD }}\` |"
+            echo "| artifact | \`${{ steps.source.outputs.key }}\` |"
+            echo "| rebuilt | ${{ needs.build.result == 'success' }} |"
+            echo "| url | ${{ vars.API_URL_PROD }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   release:
     name: release / semantic-release
     runs-on: ubuntu-latest
-    needs: [preflight, build, deploy-prod]
+    needs: [preflight, deploy-prod]
     if: |
       needs.preflight.outputs.run == 'true' &&
       github.event_name == 'push' && github.ref_name == 'main'
@@ -243,16 +317,13 @@ jobs:
     permissions:
       contents: write
     env:
-      # PSR reads the token from GH_TOKEN when publishing the GitHub release.
       GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ needs.build.outputs.sha }}
+          ref: ${{ needs.preflight.outputs.sha }}
           fetch-depth: 0
           fetch-tags: true
-          # Must be a token that can bypass branch protection on main, otherwise
-          # the release commit is rejected. GITHUB_TOKEN cannot do this.
           token: ${{ secrets.RELEASE_TOKEN }}
 
       - uses: astral-sh/setup-uv@v10.3.0
@@ -268,11 +339,11 @@ jobs:
 
       - id: next
         name: compute next version
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         run: |
           current=$(uv version --short)
           next=$(uvx --from "python-semantic-release==${PSR_VERSION}" semantic-release version --print 2>/dev/null | tail -1)
-          # `--print` returns the CURRENT version when nothing is releasable, not an
-          # empty string, so the comparison (not an emptiness check) is the guard.
           if [ -z "$next" ] || [ "$next" = "$current" ]; then
             echo "version=" >> "$GITHUB_OUTPUT"
             echo "::notice title=No release::No releasable commits since the last tag (still $current)"
