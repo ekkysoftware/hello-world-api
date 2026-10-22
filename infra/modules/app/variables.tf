@@ -17,10 +17,9 @@ variable "artifact_bucket" {
   type        = string
 }
 
-variable "bootstrap_key" {
-  description = "Placeholder object used only to create the function; CI owns the code afterwards."
+variable "source_zip" {
+  description = "Local build to create/update the function with: ./scripts/build_lambda.sh"
   type        = string
-  default     = "bootstrap/placeholder.zip"
 }
 
 variable "runtime" {

@@ -37,8 +37,11 @@ resource "aws_lambda_function" "this" {
   memory_size   = var.memory_size
   timeout       = var.timeout
 
-  s3_bucket = var.artifact_bucket
-  s3_key    = var.bootstrap_key
+  # Terraform temporarily owns the code so `apply` can ship this build to both
+  # functions. Restore the lifecycle block in infra/README.md before CI deploys,
+  # otherwise every apply reverts CI's deploy.
+  filename         = var.source_zip
+  source_code_hash = filebase64sha256(var.source_zip)
 
   environment {
     variables = {
@@ -47,10 +50,4 @@ resource "aws_lambda_function" "this" {
   }
 
   depends_on = [aws_cloudwatch_log_group.lambda]
-
-  # CI deploys code with `aws lambda update-function-code`. Without this,
-  # `terraform apply` would silently revert production to the placeholder.
-  lifecycle {
-    ignore_changes = [s3_bucket, s3_key, s3_object_version, filename, source_code_hash]
-  }
 }

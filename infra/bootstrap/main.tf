@@ -21,7 +21,7 @@ locals {
 # ---------------------------------------------------------------- state bucket
 
 resource "aws_s3_bucket" "state" {
-  bucket = local.state_bucket
+  bucket        = local.state_bucket
   force_destroy = true
 }
 
@@ -69,7 +69,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "state" {
 # ------------------------------------------------------------- artifact bucket
 
 resource "aws_s3_bucket" "artifacts" {
-  bucket = local.artifact_bucket
+  bucket        = local.artifact_bucket
   force_destroy = true
 }
 

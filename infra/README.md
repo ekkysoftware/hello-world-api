@@ -86,19 +86,41 @@ provider caches and `bootstrap/.bootstrap/placeholder.zip` behind. Run
 clean as well. Those files are gitignored, so nothing leaks into a commit either
 way.
 
-## Terraform owns the shape, CI owns the code
+## Current state: Terraform ships the code
 
-The function is created from `s3://<artifact bucket>/bootstrap/placeholder.zip`,
-which returns HTTP 503 until the first deploy. `ignore_changes` on the code
-attributes means:
+For the first end-to-end test the module uses the local build directly:
 
-- `terraform apply` will **not** roll back a CI deploy — and will not report code
-  drift either. Comparing `aws lambda get-function` output is the only way to see it.
-- To change code, use CI or `aws lambda update-function-code`, not Terraform.
+```hcl
+filename         = var.source_zip                 # ../../../dist/lambda.zip
+source_code_hash = filebase64sha256(var.source_zip)
+```
 
-Also note the buckets in `infra/bootstrap` are created with `force_destroy`, so
-`terraform destroy` wipes them and their contents — remember that the state bucket
-is the only place the other stacks' state lives.
+so `terraform apply` in `envs/staging` and `envs/prod` deploys the same zip to both
+functions. Build before planning:
+
+```bash
+./scripts/build_lambda.sh      # dist/ is gitignored, so a fresh clone must build first
+```
+
+**Before CI deploys for real, restore single ownership** — otherwise the next
+`terraform apply` reverts whatever CI shipped:
+
+```hcl
+  s3_bucket = var.artifact_bucket
+  s3_key    = "bootstrap/placeholder.zip"
+
+  lifecycle {
+    ignore_changes = [s3_bucket, s3_key, s3_object_version, filename, source_code_hash]
+  }
+```
+
+With that block, Terraform creates the function from `bootstrap/placeholder.zip`
+(HTTP 503 until the first CI run) and never touches code again. It also means
+`terraform apply` will not report code drift — `aws lambda get-function` is the only
+way to see what is actually running.
+
+Also note `prevent_destroy` on the state bucket, and that `terraform destroy` in
+`envs/prod` deletes the prod function and API while leaving the artifacts intact.
 
 ## Verify before the first apply
 

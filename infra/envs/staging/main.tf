@@ -31,6 +31,7 @@ module "app" {
   environment     = "staging"
   stage_name      = "dev"
   artifact_bucket = local.artifact_bucket
+  source_zip      = "${path.root}/../../../dist/lambda.zip"
 
   log_retention_days = 14
   cors_allow_origins = var.cors_allow_origins
